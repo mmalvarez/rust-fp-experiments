@@ -3,6 +3,20 @@ fn add(x : u32, y : u32, z : u32) -> u32 {
     x + y + z
 }
 
+struct Hello { 
+    hi : u32
+}
+
+impl Hello {
+    //#[currying::curry]
+    fn new(x : u32) -> Self {
+        Hello {hi : x}
+    }
+    fn get(&self) -> u32 {
+        self.hi
+    }
+}
+
 use std::rc::Rc;
 
 #[test]
