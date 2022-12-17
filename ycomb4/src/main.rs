@@ -81,6 +81,7 @@ fn zc<'a, A : Clone + 'a + Copy + 'static> (f :fn(A) -> A, v : A) -> A {
 }
 */
 
+
 fn zc2<'a, A : Clone + 'a + Copy + 'static> (f :fn(A) -> A, v : A) -> A {
     let f2 = f.clone();
     let f3 = f.clone();
