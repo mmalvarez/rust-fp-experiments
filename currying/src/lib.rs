@@ -1,12 +1,143 @@
 use proc_macro::TokenStream;
-use quote::{quote, format_ident};
-use syn::{parse_macro_input, Block, FnArg, ItemFn, Pat, ReturnType, Type, Receiver};
+use std::env::args;
+use quote::{quote, format_ident, ToTokens};
+use syn::{parse_macro_input, Block, FnArg, ItemFn, Pat, ReturnType, Type, Receiver, NestedMeta, Meta, Path};
+use syn::token::Comma;
+use syn::parse_quote::ParseQuote;
+use syn::parse::Parser;
+
+enum CurryBox {
+    Arc,
+    Rc,
+    Box,
+}
+
+struct CurryConfig {
+    name : String,          // name of the new curried function
+    curry_box : CurryBox,   // what box do we use for the dyn Fn?
+    bundle : bool,          // do we "bundle" the Self argument for object methods?
+    swap : bool,            // do we apply the new name to the new output or the original function?
+}
+
+impl Default for CurryConfig {
+    fn default() -> Self {
+        Self {
+            name : String::from("c_"),
+            curry_box : CurryBox::Rc,
+            bundle : true,
+            swap : false,
+        }
+    }
+}
 
 #[proc_macro_attribute]
-pub fn curry(_attr: TokenStream, item: TokenStream) -> TokenStream {
-  let parsed = parse_macro_input!(item as ItemFn); 
-  generate_curry(parsed).into() 
+pub fn curry(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed_attr = syn::punctuated::Punctuated::<syn::NestedMeta, syn::Token![,]>::parse_terminated
+        .parse(attr)
+        .unwrap();
+
+    let parsed = parse_macro_input!(item as ItemFn);
+
+    println!("Attributes: {}", parsed_attr.to_token_stream());
+
+    let options : Vec<CurryConfig> = parse_curry_configs(parsed_attr);
+
+    generate_curry(parsed, options).into()
 }
+
+fn parse_curry_config_args(curry_box : CurryBox, args : Punctuated<NestedMeta, Comma>) -> CurryConfig {
+    let mut conf = CurryConfig::default();
+    conf.curry_box = curry_box;
+
+    for arg in args.iter() {
+        match arg {
+            NestedMeta::Meta(m) => {
+                match m {
+                    Meta::Path(p) => {
+                        let p_str = quote! {#p}.to_string();
+                        if p_str == "no_bundle" {
+                            conf.bundle = false;
+                        } else if p_str == "swap" {
+                            conf.swap = true;
+                        } else {
+                            panic!("Invalid curry config argument");
+                        }
+                    }
+                    _ => {
+                        panic!("Invalid curry config argument");
+                    }
+                }
+            },
+            NestedMeta::Lit(l) => {
+                conf.name = quote!{#l}.to_string();
+            },
+        }
+    }
+
+    conf
+}
+
+fn parse_curry_config(curry_box : Path, curry_args : Option<Punctuated<NestedMeta, Comma>>) -> CurryConfig {
+    let curry_box_s = quote!{#curry_box}.to_string();
+    let cb = if curry_box_s == "Arc" {
+        CurryBox::Arc
+    } else if curry_box_s == "Rc" {
+        CurryBox::Rc
+    } else if curry_box_s == "Box" {
+        CurryBox::Box
+    } else {
+        panic!("Invalid curry box")
+    };
+
+    match curry_args {
+        None => {
+            let mut config = CurryConfig::default();
+            config.curry_box = cb;
+            config
+        },
+        Some(args) => {
+            parse_curry_config_args(cb, args)
+        },
+    }
+}
+
+fn parse_curry_configs(attr : Punctuated<NestedMeta, Comma>) -> Vec<CurryConfig> {
+    let mut configs = vec![];
+    for e in attr.iter() {
+        match e {
+            NestedMeta::Meta(m) =>  {
+                match m {
+                    Meta::List(l) => {
+                        let next = parse_curry_config(l.path.clone(), Some(l.nested.clone()));
+                        configs.push(next);
+                    },
+                    Meta::Path(p) => {
+                        let next = parse_curry_config(p.clone(), None);
+                        configs.push(next);
+                    },
+                    _ => {
+                        panic!("Invalid curry config specification");
+                    },
+                }
+            },
+            NestedMeta::Lit(l) => {
+                panic!("Invalid curry config specification");
+            },
+        }
+    }
+
+    // update empty config with default
+    if configs.len() == 0 {
+        configs.push(CurryConfig::default())
+    }
+
+    configs
+}
+
+/*
+ * Format for macro arguments:
+ * curry(Box("n1", bundle), Arc("n2", bundle, swap), Arc("n3"))
+ */
 
 use syn::punctuated::Punctuated;
 
@@ -109,7 +240,7 @@ fn generate_type_aliases(
     return type_aliases;
 }
 
-fn generate_curry(parsed: ItemFn) -> proc_macro2::TokenStream {
+fn generate_curry(parsed: ItemFn, options : Vec<CurryConfig>) -> proc_macro2::TokenStream {
     let fn_body = parsed.block.clone();
     let sig = parsed.sig.clone();
     let vis = parsed.vis.clone();
