@@ -1,8 +1,8 @@
-use proc_macro::TokenStream;
+use proc_macro::{Ident, TokenStream};
 use std::env::args;
 use quote::{quote, format_ident, ToTokens};
 use syn::{parse_macro_input, Block, FnArg, ItemFn, Pat, ReturnType, Type, Receiver, NestedMeta, Meta, Path};
-use syn::token::Comma;
+use syn::token::{Comma, Token};
 use syn::parse_quote::ParseQuote;
 use syn::parse::Parser;
 
@@ -10,13 +10,33 @@ enum CurryBox {
     Arc,
     Rc,
     Box,
+    Orig,
 }
 
 struct CurryConfig {
-    name : String,          // name of the new curried function
-    curry_box : CurryBox,   // what box do we use for the dyn Fn?
-    bundle : bool,          // do we "bundle" the Self argument for object methods?
-    swap : bool,            // do we apply the new name to the new output or the original function?
+    name : String,                  // name of the new curried function
+    curry_box : Option<CurryBox>,   // what box do we use for the dyn Fn? (keep original, if none)
+    bundle : bool,                  // do we "bundle" the Self argument for object methods?
+}
+
+impl ToString for CurryBox {
+    fn to_string(&self) -> String {
+        match self {
+            CurryBox::Arc => String::from("Arc"),
+            CurryBox::Rc => String::from("Rc"),
+            CurryBox::Box => String::from("Box")
+        }
+    }
+}
+
+impl CurryBox {
+    fn to_token_stream(&self) -> proc_macro2::TokenStream {
+        match self {
+            CurryBox::Arc => quote! {Arc},
+            CurryBox::Rc => quote!{Rc},
+            CurryBox::Box => quote!{Box},
+        }
+    }
 }
 
 impl Default for CurryConfig {
@@ -32,6 +52,9 @@ impl Default for CurryConfig {
 
 #[proc_macro_attribute]
 pub fn curry(attr: TokenStream, item: TokenStream) -> TokenStream {
+
+    println!("HELLO THERE");
+
     let parsed_attr = syn::punctuated::Punctuated::<syn::NestedMeta, syn::Token![,]>::parse_terminated
         .parse(attr)
         .unwrap();
@@ -42,7 +65,7 @@ pub fn curry(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let options : Vec<CurryConfig> = parse_curry_configs(parsed_attr);
 
-    generate_curry(parsed, options).into()
+    generate_currys(parsed, options).into()
 }
 
 fn parse_curry_config_args(curry_box : CurryBox, args : Punctuated<NestedMeta, Comma>) -> CurryConfig {
@@ -140,6 +163,7 @@ fn parse_curry_configs(attr : Punctuated<NestedMeta, Comma>) -> Vec<CurryConfig>
  */
 
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 
 fn extract_arg_pat(a : FnArg) -> Box<Pat> {
     match a {
@@ -162,11 +186,12 @@ fn extract_arg_pat_idents(fn_args : Punctuated<FnArg, syn::token::Comma>) -> Vec
     return fn_args.into_iter().map(extract_arg_pat).collect::<Vec<_>>();
 }
 
-fn generate_body (fn_args : &[Box<Pat>], body : Box<Block>) -> proc_macro2::TokenStream {
+fn generate_body (fn_args : &[Box<Pat>], body : Box<Block>, curry_box : &CurryBox) -> proc_macro2::TokenStream {
     let mut acc = quote! {#body};
+    let c_box = curry_box.to_token_stream();
     for arg in fn_args.iter().rev() {
         acc = quote! {
-            Rc::new(move |#arg| {#acc})
+            #c_box ::new(move |#arg| {#acc})
         }
     };
     return quote! { return #acc }
@@ -190,123 +215,119 @@ fn extract_return_type(a : ReturnType) -> Box<Type> {
     }
 }
 
-fn fix_type_ident (i : &syn::Ident) -> syn::Ident {
+fn curry_fn_name (i : syn::Ident, prefix : String) -> syn::Ident {
     let i_str = i.to_string();
-    let i_str = i_str[0..1].to_uppercase() + &i_str[1..];
+    let i_str = format!("{}_{}", prefix, i_str);
     syn::Ident::new(&i_str, i.span())
 }
 
-fn curry_fn_name (i : &syn::Ident) -> syn::Ident {
-    let i_str = i.to_string();
-    let i_str = format!("c_{}", i_str);
-    syn::Ident::new(&i_str, i.span())
-}
-
-fn generate_types(
-    fn_arg_types: &[Box<Type>],
+fn generate_return_type(
+    fn_arg_types: &[Box<Pat>],
     fn_return_type: Box<Type>,
-    fn_name: &syn::Ident,
+    curry_box : &CurryBox,
 ) -> proc_macro2::TokenStream {
     
     let mut acc = quote! { #fn_return_type };
+    let c_box = curry_box.to_token_stream();
 
     for t in fn_arg_types.into_iter().rev() {
         acc = quote! {
-            Rc<dyn Fn(#t) -> #acc>
+            #c_box<dyn Fn(#t) -> #acc>
         }
     };
+
+    println!("Generating a return type, but we get {}", acc);
+
     return acc
 }
 
-
-fn generate_type_aliases(
-    fn_arg_types: &[Box<Type>],
-    fn_return_type: Box<Type>,
-    fn_name: &syn::Ident,
-) -> Vec<proc_macro2::TokenStream> {
-    
-    let type_t0 = format_ident!("C{}XT0", fn_name);
-    let mut type_aliases = vec![quote! { type #type_t0 = #fn_return_type }];
-
-    for (i, t) in (1..).zip(fn_arg_types.into_iter().rev()) {
-        let p = format_ident!("C{}X{}", fn_name, format!("T{}", i-1));
-        let n = format_ident!("C{}X{}", fn_name, format!("T{}", i));
-
-        type_aliases.push(quote! {
-            type #n = Rc<dyn Fn(#t) -> #p>
-        });
-    }
-
-    return type_aliases;
-}
-
-fn generate_curry(parsed: ItemFn, options : Vec<CurryConfig>) -> proc_macro2::TokenStream {
+// when swapping, we need to rename and reconstruct the input function
+fn rename_function(parsed : ItemFn, new_name : String) -> proc_macro2::TokenStream {
     let fn_body = parsed.block.clone();
     let sig = parsed.sig.clone();
     let vis = parsed.vis.clone();
-    let fn_name_fixed = fix_type_ident(&sig.ident);
-    let curry_fn_name = curry_fn_name(&sig.ident);
+
     let fn_args = sig.inputs;
     let fn_return_type = sig.output;
 
-    let (recv, arg_idents) = extract_arg_idents(fn_args.clone());
-    match recv {
-        None => {            
-            let first_ident = arg_idents.first().unwrap();
+    let new_name_ident = syn::Ident::new(&new_name, parsed.span());
 
-            let curried_body = generate_body(&arg_idents[1..], fn_body.clone());
-
-            let arg_types = extract_arg_types(fn_args.clone());
-            let first_type = &arg_types.first().unwrap();
-            let type_aliases = generate_type_aliases(
-                &arg_types[1..],
-                extract_return_type(fn_return_type),
-                &fn_name_fixed,
-            );
-
-            let return_type = format_ident!("C{}X{}", &fn_name_fixed, format!("T{}", type_aliases.len() - 1));
-
-            let curry_result = quote! {
-                #(#type_aliases);* ;
-                #vis fn #curry_fn_name (#first_ident : #first_type) -> #return_type {
-                    #curried_body ;
-                }
-            };
-
-            let result = quote! {
-                #parsed
-                #curry_result
-            };
-
-            return result;
-        },
-        Some(recv) => {
-            let curried_body = generate_body(&arg_idents, fn_body.clone());
-
-            let arg_types = extract_arg_types(fn_args.clone());
-            let first_type = &arg_types.first().unwrap();
-            let type_aliases = generate_type_aliases(
-                &arg_types,
-                extract_return_type(fn_return_type),
-                &fn_name_fixed,
-            );
-
-            let return_type = format_ident!("C{}X{}", &fn_name_fixed, format!("T{}", type_aliases.len() - 1));
-
-            let curry_result = quote! {
-                #(#type_aliases);* ;
-                #vis fn #curry_fn_name #recv -> #return_type {
-                    #curried_body ;
-                }
-            };
-
-            let result = quote! {
-                #parsed
-                #curry_result
-            };
-
-            return result;
-
-        },
+    quote! {
+        #vis fn #new_name_ident (#fn_args) -> #fn_return_type {
+            #fn_body ;
+        }
     }
+}
+
+fn generate_curry(parsed: ItemFn, options : CurryConfig) -> proc_macro2::TokenStream {
+    let fn_body = parsed.block.clone();
+    let sig = parsed.sig.clone();
+    let vis = parsed.vis.clone();
+    let (curry_fn_name, orig_fn_name) = if options.swap {
+        (
+            sig.ident.clone(),
+            curry_fn_name(sig.ident.clone(), options.name),
+        )
+    } else {
+        (
+            curry_fn_name(sig.ident.clone(), options.name),
+            sig.ident.clone(),
+        )
+    };
+
+    let fn_args = sig.inputs;
+    let fn_return_type = extract_return_type(sig.output);
+
+    let (recv, arg_idents) = extract_arg_idents(fn_args.clone());
+    let first_ident = arg_idents.first().unwrap();
+    let arg_types = extract_arg_types(fn_args.clone());
+    let first_type = &arg_types.first().unwrap();
+
+    let (initial_args, remaining_args) = match recv {
+        None => {
+            (quote! { (#first_ident : #first_type) }, &arg_idents[1..])
+        }
+        Some(recv) => {
+            if options.bundle {
+                (quote! { (#recv, #first_ident : #first_type) }, &arg_idents[1..])
+            } else {
+                (quote! { (#recv) }, &arg_idents[0..])
+            }
+        }
+    };
+
+
+    let curried_body = generate_body(remaining_args, fn_body.clone(), &options.curry_box);
+
+    let curried_return_type = generate_return_type(remaining_args, fn_return_type, &options.curry_box);
+
+    let curry_result = quote! {
+        #vis fn #curry_fn_name #initial_args -> #curried_return_type {
+            #curried_body ;
+        }
+    };
+
+    let orig_result = rename_function(parsed.clone(), orig_fn_name.to_string());
+
+    return
+        quote! {
+            #orig_result
+            #curry_result
+        }
+}
+
+fn generate_currys(parsed: ItemFn, options : Vec<CurryConfig>) -> proc_macro2::TokenStream {
+    let mut result = quote!{};
+
+    for cfg in options {
+        let next = generate_curry(parsed.clone(), cfg);
+        result = quote! {
+            #result
+            #next
+        }
+    }
+
+    println!("Final currying result: {}", result);
+
+    result
 }
